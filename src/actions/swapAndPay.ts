@@ -1,33 +1,28 @@
-// /src/actions/swapAndPay.ts
-// Flujo 2 pasos: (1) swap con 0x  →  (2) transfer del buyToken al receiver
-// Compatible con tu erc20.ts que requiere provider/wallet explícitos
-
+// Flujo: approve (si falta) → swap 0x → transfer del buyToken al receiver
 import type { Address, Hex } from "viem";
-import { getPublicClient, getWalletClient } from "@wagmi/core";
-import { config as wagmiConfig } from "../lib/wagmi"; // ajusta la ruta si está en otro lado
 import {
-  ensureAllowance,
-  readBalanceOf,
-  sendTransfer,
-} from "../lib/erc20";
+  getPublicClient,
+  getWalletClient,
+  getChainId,
+  switchChain,
+} from "@wagmi/core";
+import { parseAbiItem } from "viem";
+import { config as wagmiConfig } from "../lib/wagmi";
+import { ensureAllowance, readBalanceOf, sendTransfer } from "../lib/erc20";
 
-// Tipos mínimos del quote que devuelve 0x (allowance-holder/quote)
 export type OxQuote = {
   to: Address;
   data: Hex;
-  value?: bigint;            // normalmente 0n en ERC20→ERC20
-  buyAmount: string;         // base units (string)
-  allowanceTarget?: Address; // spender para approve del sellToken
+  value?: bigint;
+  buyAmount: string;         // base units
+  allowanceTarget?: Address;
 };
 
 export type SwapAndPayParams = {
-  quote: OxQuote;               // respuesta de 0x
-  receiver: Address;            // wallet destino (comercio)
-  buyTokenAddress: Address;     // token que recibes del swap y vas a transferir (p. ej., USDC)
-  autoApprove?: {               // opcional: hacer approve automático si falta
-    sellToken: Address;         // token que vendes (p. ej., WMON)
-    sellAmount: bigint;         // base units
-  };
+  quote: OxQuote;
+  receiver: Address;
+  buyTokenAddress: Address;
+  autoApprove?: { sellToken: Address; sellAmount: bigint };
 };
 
 export type SwapAndPayResult = {
@@ -35,69 +30,90 @@ export type SwapAndPayResult = {
   transferHash: `0x${string}`;
 };
 
-// Helpers internos para asegurar clientes
-function requirePublicClient() {
-  const pc = getPublicClient(wagmiConfig);
-  if (!pc) throw new Error("No se pudo obtener publicClient. Revisa tu WagmiConfig.");
-  return pc;
-}
-async function requireWalletClient() {
-  const wc = await getWalletClient(wagmiConfig);
-  if (!wc) throw new Error("Conecta tu wallet para continuar.");
-  return wc;
+function sleep(ms: number) {
+  return new Promise((r) => setTimeout(r, ms));
 }
 
-/**
- * 1) (opcional) ensureAllowance infinito si falta
- * 2) Ejecuta el swap (to+data[+value])
- * 3) Transfiere buyToken al receiver (min(balance, buyAmount))
- */
 export async function swapAndPay(params: SwapAndPayParams): Promise<SwapAndPayResult> {
   const { quote, receiver, buyTokenAddress, autoApprove } = params;
 
-  const publicClient = requirePublicClient();
-  const walletClient = await requireWalletClient();
+  const publicClient = getPublicClient(wagmiConfig);
+  if (!publicClient) throw new Error("No se pudo obtener publicClient.");
+  const walletClient = await getWalletClient(wagmiConfig);
+  if (!walletClient) throw new Error("Conecta tu wallet para continuar.");
 
   const account = walletClient.account?.address as Address | undefined;
   if (!account) throw new Error("No se detectó la cuenta conectada.");
 
-  // (1) Approve automático si hace falta y tenemos allowanceTarget
-  if (autoApprove && quote.allowanceTarget) {
-    await ensureAllowance({
-      provider: publicClient as any,       // ✅ ahora pasamos provider
-      wallet: walletClient as any,         // ✅ y wallet
-      token: autoApprove.sellToken,
-      owner: account,
-      spender: quote.allowanceTarget,
-      requiredAmount: autoApprove.sellAmount,
-      useExact: false, // infinito (one-time approve UX)
-    });
-    // Si quieres esperar confirmación del approve aquí, puedes capturar el txHash
-    // y esperar el receipt; en tu erc20.ts ensureAllowance ya devuelve { approved, txHash? }.
+  // Garantiza chainId=10143
+  const current = await getChainId(wagmiConfig);
+  if (current !== 10143) {
+    try {
+      await switchChain(wagmiConfig, { chainId: 10143 });
+    } catch {
+      await walletClient.switchChain?.({ id: 10143 });
+    }
   }
 
-  // (2) SWAP vía 0x
+  // Approve si falta
+  if (autoApprove && quote.allowanceTarget) {
+    const { approved, txHash } = await ensureAllowance({
+      provider: publicClient as any,
+      wallet: walletClient as any,
+      token: autoApprove.sellToken,
+      owner: account,
+      spender: quote.allowanceTarget as Address,
+      requiredAmount: autoApprove.sellAmount,
+      useExact: false, // infinito
+    });
+    if (!approved && txHash) {
+      await publicClient.waitForTransactionReceipt({ hash: txHash });
+    }
+  }
+
+  // Sanity check del 'to'
+  if (!quote.to || (quote.to as string).length !== 42) {
+    throw new Error(`Quote inválido: 'to' no es address 20 bytes: ${quote.to}`);
+  }
+
+  // SWAP
   const swapHash = await walletClient.sendTransaction({
     to: quote.to,
     data: quote.data,
     value: quote.value ?? 0n,
     account,
   });
+  const swapReceipt = await publicClient.waitForTransactionReceipt({ hash: swapHash });
 
-  await publicClient.waitForTransactionReceipt({ hash: swapHash });
-
-  // (3) TRANSFER del buyToken al receiver
+  // Lee balance del buyToken con reintentos
   const expectedOut = BigInt(quote.buyAmount);
+  const tries = 6;
+  let balance = 0n;
+  for (let i = 0; i < tries; i++) {
+    balance = await readBalanceOf(publicClient as any, buyTokenAddress, account);
+    if (balance > 0n) break;
+    await sleep(250);
+  }
 
-  // ✅ readBalanceOf requiere (provider, token, owner)
-  const balance = await readBalanceOf(publicClient as any, buyTokenAddress, account);
-
-  const amountToSend = balance < expectedOut ? balance : expectedOut;
-  if (amountToSend === 0n) {
+  if (balance === 0n) {
+    try {
+      const TransferEvt = parseAbiItem(
+        "event Transfer(address indexed from, address indexed to, uint256 value)"
+      );
+      const logs = await publicClient.getLogs({
+        address: buyTokenAddress,
+        event: TransferEvt,
+        args: { to: account },
+        fromBlock: swapReceipt.blockNumber,
+        toBlock: swapReceipt.blockNumber,
+      });
+      console.warn("[swapAndPay] Transfer logs hacia taker", logs);
+    } catch {}
     throw new Error("No se recibió el buyToken tras el swap. Revisa tokens/decimales/slippage.");
   }
 
-  // ✅ sendTransfer requiere (wallet, token, to, amount, account?)
+  // Transfer al receiver (manda el menor entre balance y expectedOut)
+  const amountToSend = balance < expectedOut ? balance : expectedOut;
   const transferHash = await sendTransfer(
     walletClient as any,
     buyTokenAddress,

@@ -1,21 +1,17 @@
-// /src/lib/zeroEx.ts
-// 0x Swap API v2 helpers vía PROXY (evita CORS y ocultas API key/headers)
-// - Usa VITE_ZEROX_PROXY_URL (ej: https://.../quote)
-// - Si llamas getOxPrice, derive /price a partir de la URL del proxy.
-
+// src/lib/zeroEx.ts
 import type { Address, Hex } from "viem";
 
 export type OxPrice = {
   price: string;
-  buyAmount: string;   // base units
-  sellAmount: string;  // base units
+  buyAmount: string;
+  sellAmount: string;
   value?: string;
 };
 
 export type OxQuote = {
   to: Address;
   data: Hex;
-  buyAmount: string;            // base units
+  buyAmount: string;
   value?: bigint;
   allowanceTarget?: Address;
 };
@@ -23,36 +19,20 @@ export type OxQuote = {
 export type GetOxCommonParams = {
   sellToken: Address;
   buyToken: Address;
-  sellAmount: string | bigint;  // base units
+  sellAmount: string | bigint; // base units
   taker: Address;
-  slippageBps?: number;
-  chainId?: number;             // default 10143
+  slippageBps?: number;        // 100 = 1%
+  chainId?: number;            // default 10143
 };
 
 const DEFAULT_CHAIN_ID = 10143 as const;
 
-// Base del proxy (no agregamos headers desde el cliente)
 const PROXY_QUOTE =
   (typeof import.meta !== "undefined" && (import.meta as any).env?.VITE_ZEROX_PROXY_URL) ||
   (typeof process !== "undefined" && process.env?.VITE_ZEROX_PROXY_URL) ||
   "";
-if (!PROXY_QUOTE) {
-  // eslint-disable-next-line no-console
-  console.warn("[0x] No hay VITE_ZEROX_PROXY_URL. Configúralo en .env");
-}
 
-// Derivar /price desde /quote si aplica
-function derivePriceUrl(from: string) {
-  try {
-    const u = new URL(from);
-    u.pathname = u.pathname.replace(/quote$/, "price");
-    return u.toString();
-  } catch {
-    // fallback simple si no es URL válida
-    return from.replace(/quote$/, "price");
-  }
-}
-
+// ---------- utils ----------
 function toQuery(params: Record<string, string | number | undefined>) {
   const q = new URLSearchParams();
   for (const [k, v] of Object.entries(params)) {
@@ -66,11 +46,12 @@ async function parseJsonOrThrow<T>(res: Response): Promise<T> {
   if (!res.ok) {
     try {
       const j = JSON.parse(txt);
-      const msg = j?.validationErrors?.length
-        ? `${j.reason || "ValidationError"}: ${j.validationErrors
-            .map((e: any) => `${e?.field} ${e?.reason}`)
-            .join(", ")}`
-        : j?.reason || j?.message || txt;
+      const msg =
+        j?.reason ||
+        j?.message ||
+        (j?.validationErrors?.length
+          ? j.validationErrors.map((e: any) => `${e.field} ${e.reason}`).join(", ")
+          : txt);
       throw new Error(`0x API error (${res.status}): ${msg}`);
     } catch {
       throw new Error(`0x API error (${res.status}): ${txt}`);
@@ -83,19 +64,47 @@ async function parseJsonOrThrow<T>(res: Response): Promise<T> {
   }
 }
 
-// ------- API (vía proxy) -------
+/** Normaliza 0x padded (32 bytes) a address 20 bytes */
+function as20ByteAddress(maybe?: string): Address | undefined {
+  if (!maybe) return undefined;
+  if (maybe.startsWith("0x") && maybe.length === 42) return maybe as Address;
+  if (maybe.startsWith("0x") && maybe.length === 66) {
+    return ("0x" + maybe.slice(-40)) as Address;
+  }
+  return undefined;
+}
+function mustAddress(maybe: string | undefined, field: string): Address {
+  const a = as20ByteAddress(maybe);
+  if (!a) throw new Error(`0x quote inválido: ${field}=${maybe}`);
+  return a;
+}
 
-/** Vista previa (sin calldata) — usa /price del proxy si existe */
+function derivePriceUrl(from: string) {
+  try {
+    const u = new URL(from);
+    u.pathname = u.pathname.replace(/quote$/, "price");
+    return u.toString();
+  } catch {
+    return from.replace(/quote$/, "price");
+  }
+}
+// ---------- end utils ----------
+
 export async function getOxPrice(p: GetOxCommonParams): Promise<OxPrice> {
+  if (!PROXY_QUOTE || !/\/quote$/.test(PROXY_QUOTE)) {
+    throw new Error(
+      `Config VITE_ZEROX_PROXY_URL inválida: "${PROXY_QUOTE}". Debe terminar en ".../swap/allowance-holder/quote".`
+    );
+  }
   const chainId = p.chainId ?? DEFAULT_CHAIN_ID;
-  const priceUrl = derivePriceUrl(PROXY_QUOTE);
   const url =
-    `${priceUrl}?` +
+    `${derivePriceUrl(PROXY_QUOTE)}?` +
     toQuery({
       sellToken: p.sellToken,
       buyToken: p.buyToken,
       sellAmount: typeof p.sellAmount === "bigint" ? p.sellAmount.toString() : p.sellAmount,
       taker: p.taker,
+      recipient: p.taker,
       slippageBps: p.slippageBps ?? 100,
       chainId,
     });
@@ -104,8 +113,12 @@ export async function getOxPrice(p: GetOxCommonParams): Promise<OxPrice> {
   return parseJsonOrThrow<OxPrice>(res);
 }
 
-/** Cotización ejecutable (to+data+allowanceTarget) — usa /quote del proxy */
 export async function getOxQuote(p: GetOxCommonParams): Promise<OxQuote> {
+  if (!PROXY_QUOTE || !/\/quote$/.test(PROXY_QUOTE)) {
+    throw new Error(
+      `Config VITE_ZEROX_PROXY_URL inválida: "${PROXY_QUOTE}". Debe terminar en ".../swap/allowance-holder/quote".`
+    );
+  }
   const chainId = p.chainId ?? DEFAULT_CHAIN_ID;
   const url =
     `${PROXY_QUOTE}?` +
@@ -114,6 +127,7 @@ export async function getOxQuote(p: GetOxCommonParams): Promise<OxQuote> {
       buyToken: p.buyToken,
       sellAmount: typeof p.sellAmount === "bigint" ? p.sellAmount.toString() : p.sellAmount,
       taker: p.taker,
+      recipient: p.taker, // fuerza output al taker
       slippageBps: p.slippageBps ?? 100,
       chainId,
     });
@@ -121,12 +135,24 @@ export async function getOxQuote(p: GetOxCommonParams): Promise<OxQuote> {
   const res = await fetch(url, { method: "GET" });
   const j = await parseJsonOrThrow<any>(res);
 
+  // soporta formatos alternativos (algunos proxies/SDKs)
+  const toRaw =
+    j.to ?? j.tx?.to ?? j.transaction?.to ?? j.swapTransaction?.to ?? j.swap?.to;
+  const dataRaw =
+    j.data ?? j.tx?.data ?? j.transaction?.data ?? j.swapTransaction?.data ?? j.swap?.data;
+  const valueRaw =
+    j.value ?? j.tx?.value ?? j.transaction?.value ?? j.swapTransaction?.value ?? j.swap?.value;
+  const buyAmountRaw =
+    j.buyAmount ?? j.buyAmountBaseUnits ?? j.buyAmountWei ?? j.outputAmount;
+  const allowanceRaw =
+    j.allowanceTarget ?? j.allowanceTargetAddress ?? j.spender;
+
   return {
-    to: j.to,
-    data: j.data as Hex,
-    buyAmount: j.buyAmount,
-    value: j.value ? BigInt(j.value) : undefined,
-    allowanceTarget: j.allowanceTarget as Address | undefined,
+    to: mustAddress(toRaw, "to"),
+    data: dataRaw as Hex,
+    buyAmount: String(buyAmountRaw),
+    value: valueRaw ? BigInt(valueRaw) : undefined,
+    allowanceTarget: as20ByteAddress(allowanceRaw),
   };
 }
 

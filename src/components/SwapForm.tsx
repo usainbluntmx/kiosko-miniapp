@@ -1,11 +1,10 @@
-// /src/components/SwapForm.tsx
 "use client";
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { Address } from "viem";
 import { parseUnits } from "viem";
 import { useAccount, useConnect } from "wagmi";
-import { getPublicClient, getWalletClient } from "@wagmi/core";
+import { getPublicClient, getWalletClient, getChainId, switchChain } from "@wagmi/core";
 
 import { config as wagmiConfig } from "../lib/wagmi";
 import { getOxQuote, type OxQuote } from "../lib/zeroEx";
@@ -18,21 +17,18 @@ import {
   getTokenBySymbol,
 } from "../lib/tokens";
 
-// Filtra tokens visibles en UI
-const SELECTABLE = TOKENS.filter((t) => ["MON", "WMON", "USDC"].includes(t.symbol));
+const SELECTABLE = TOKENS.filter((t) => ["WMON", "USDC"].includes(t.symbol));
 const getAddr = (sym: string) => getTokenBySymbol(sym)?.address as Address;
 
 export default function SwapForm() {
   const { address, isConnected } = useAccount();
   const { connect, connectors, isPending: isConnecting } = useConnect();
 
-  // UI State
-  const [sellSymbol, setSellSymbol] = useState<"MON" | "WMON" | "USDC">("WMON");
-  const [buySymbol, setBuySymbol] = useState<"MON" | "WMON" | "USDC">("USDC");
+  const [sellSymbol, setSellSymbol] = useState<"WMON">("WMON");
+  const [buySymbol] = useState<"USDC">("USDC");
   const [uiAmount, setUiAmount] = useState<string>("0.01");
   const [receiver, setReceiver] = useState<Address>("0x" as Address);
 
-  // Exec State
   const [quote, setQuote] = useState<OxQuote | null>(null);
   const [swapHash, setSwapHash] = useState<`0x${string}` | null>(null);
   const [transferHash, setTransferHash] = useState<`0x${string}` | null>(null);
@@ -40,7 +36,6 @@ export default function SwapForm() {
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState<boolean>(false);
 
-  // Debounce (cotización automática)
   const debounce = useRef<number | null>(null);
 
   const connectInjected = () => {
@@ -63,12 +58,9 @@ export default function SwapForm() {
     if (!uiAmount || isNaN(n) || n <= 0) {
       throw new Error("Monto inválido.");
     }
-    if (sellSymbol === buySymbol) {
-      throw new Error("Selecciona tokens distintos para vender y recibir.");
-    }
   };
 
-  // Resolver addresses/decimales (MON → WMON para hablar con 0x)
+  // Resolución (MON→WMON no aplica aquí; solo WMON/USDC)
   const resolved = useMemo(() => {
     const sellToken = resolveSellTokenAddress(sellSymbol) as Address;
     const buyToken = resolveSellTokenAddress(buySymbol) as Address;
@@ -76,13 +68,12 @@ export default function SwapForm() {
     return { sellToken, buyToken, sellDecimals };
   }, [sellSymbol, buySymbol]);
 
-  // Cotización automática (debounced)
+  // Cotización automática
   useEffect(() => {
     if (!isConnected || !address) return;
     if (!receiver || receiver.length < 42) return;
     const n = Number(uiAmount);
     if (!uiAmount || isNaN(n) || n <= 0) return;
-    if (sellSymbol === buySymbol) return;
 
     if (debounce.current) window.clearTimeout(debounce.current);
     debounce.current = window.setTimeout(async () => {
@@ -95,11 +86,13 @@ export default function SwapForm() {
           buyToken: resolved.buyToken,
           sellAmount,
           taker: address as Address,
-          slippageBps: 100,
+          slippageBps: 150,
           chainId: 10143,
         });
         setQuote(q);
         setStatus("Quote listo.");
+        // debug corto
+        // console.log("[quote]", { to: q.to, allowanceTarget: q.allowanceTarget, buyAmount: q.buyAmount });
       } catch (err: any) {
         setQuote(null);
         setStatus("");
@@ -110,9 +103,8 @@ export default function SwapForm() {
     return () => {
       if (debounce.current) window.clearTimeout(debounce.current);
     };
-  }, [isConnected, address, receiver, uiAmount, sellSymbol, buySymbol, resolved.sellDecimals, resolved.sellToken, resolved.buyToken]);
+  }, [isConnected, address, receiver, uiAmount, resolved.sellDecimals, resolved.sellToken, resolved.buyToken]);
 
-  // Ejecutar: approve (si falta) → swap → transfer
   async function handleSwapAndPay() {
     try {
       validateInputs();
@@ -126,32 +118,41 @@ export default function SwapForm() {
       const sellAmount = parseUnits(uiAmount, resolved.sellDecimals);
 
       const publicClient = getPublicClient(wagmiConfig);
-      if (!publicClient) throw new Error("No hay publicClient. Revisa tu configuración de wagmi.");
+      if (!publicClient) throw new Error("No hay publicClient. Revisa tu configuración.");
       const walletClient = await getWalletClient(wagmiConfig);
       if (!walletClient) throw new Error("No hay wallet conectada.");
 
-      if (quote.allowanceTarget) {
-        setStatus("Verificando permiso (approve)...");
-        const { approved, txHash } = await ensureAllowance({
-          provider: publicClient as any,
-          wallet: walletClient as any,
-          token: resolved.sellToken,
-          owner: taker,
-          spender: quote.allowanceTarget as Address,
-          requiredAmount: sellAmount,
-          useExact: false, // approve infinito
-        });
-        if (!approved && txHash) {
-          setStatus("Confirmando approve en la red…");
-          await publicClient.waitForTransactionReceipt({ hash: txHash });
-        }
+      // Asegura chain correcta
+      const current = await getChainId(wagmiConfig);
+      if (current !== 10143) {
+        try { await switchChain(wagmiConfig, { chainId: 10143 }); }
+        catch { await walletClient.switchChain?.({ id: 10143 }); }
       }
 
+      // Approve (si falta)
+      setStatus("Verificando permiso (approve)...");
+      const { approved, txHash } = await ensureAllowance({
+        provider: publicClient as any,
+        wallet: walletClient as any,
+        token: resolved.sellToken,            // WMON
+        owner: taker,
+        spender: quote.allowanceTarget as Address,
+        requiredAmount: sellAmount,
+        useExact: false,
+      });
+      if (!approved && txHash) {
+        setStatus("Confirmando approve en la red…");
+        await publicClient.waitForTransactionReceipt({ hash: txHash });
+        setStatus("Approve listo ✅");
+      }
+
+      // Swap & Pay
       setStatus("Ejecutando swap y pago…");
       const res = await swapAndPay({
         quote,
         receiver,
         buyTokenAddress: (getAddr(buySymbol) ?? resolved.buyToken) as Address,
+        autoApprove: { sellToken: resolved.sellToken, sellAmount },
       });
 
       setStatus("¡Listo! Swap & Pay ejecutado ✅");
@@ -164,8 +165,6 @@ export default function SwapForm() {
       setBusy(false);
     }
   }
-
-  const buyOptions = SELECTABLE.filter((t) => t.symbol !== sellSymbol);
 
   return (
     <div className="max-w-md mx-auto p-4 rounded-2xl border shadow">
@@ -186,7 +185,6 @@ export default function SwapForm() {
       )}
 
       <div className="grid gap-3">
-        {/* Sell token */}
         <label className="grid gap-1">
           <span className="text-sm">Token a vender</span>
           <select
@@ -194,31 +192,19 @@ export default function SwapForm() {
             value={sellSymbol}
             onChange={(e) => setSellSymbol(e.target.value as any)}
           >
-            {SELECTABLE.map((t) => (
-              <option key={t.symbol} value={t.symbol}>
-                {t.symbol === "MON" ? "MON (nativo → WMON)" : t.symbol}
-              </option>
+            {SELECTABLE.filter((t) => t.symbol === "WMON").map((t) => (
+              <option key={t.symbol} value={t.symbol}>{t.symbol}</option>
             ))}
           </select>
         </label>
 
-        {/* Buy token */}
         <label className="grid gap-1">
           <span className="text-sm">Token a recibir</span>
-          <select
-            className="border rounded-lg px-3 py-2"
-            value={buySymbol}
-            onChange={(e) => setBuySymbol(e.target.value as any)}
-          >
-            {buyOptions.map((t) => (
-              <option key={t.symbol} value={t.symbol}>
-                {t.symbol === "MON" ? "MON (nativo → WMON)" : t.symbol}
-              </option>
-            ))}
+          <select className="border rounded-lg px-3 py-2" value={buySymbol} disabled>
+            <option value="USDC">USDC</option>
           </select>
         </label>
 
-        {/* Amount */}
         <label className="grid gap-1">
           <span className="text-sm">Monto</span>
           <input
@@ -230,9 +216,8 @@ export default function SwapForm() {
           />
         </label>
 
-        {/* Receiver */}
         <label className="grid gap-1">
-          <span className="text-sm">Wallet destino (recibe {buySymbol})</span>
+          <span className="text-sm">Wallet destino (recibe USDC)</span>
           <input
             className="border rounded-lg px-3 py-2 font-mono"
             value={receiver}
