@@ -1,0 +1,42 @@
+:root {
+  --color-primary: #6c5ce7;
+  --color-bg: #f5f6fa;
+  --color-text: #2d3436;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  font-family: Inter, system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
+  background: var(--color-bg);
+  color: var(--color-text);
+}
+
+h1, h2, h3 { margin: 0.5em 0; }
+
+button {
+  padding: 10px 16px;
+  border-radius: 8px;
+  border: none;
+  background: var(--color-primary);
+  color: white;
+  font-weight: 600;
+  cursor: pointer;
+  transition: 0.2s ease-in-out;
+}
+
+button:hover { opacity: 0.9; }
+button:disabled { background: #bbb; cursor: not-allowed; }
+
+input {
+  padding: 8px 12px;
+  border: 1px solid #dfe6e9;
+  background: white;
+  border-radius: 8px;
+}
+label {
+  font-size: 13px;
+  font-weight: 600;
+  opacity: 0.8;
+}

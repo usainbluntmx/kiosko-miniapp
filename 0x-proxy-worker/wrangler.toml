@@ -1,0 +1,7 @@
+name = "0x-proxy-worker"
+main = "src/index.js"
+compatibility_date = "2024-06-20"
+
+# Si usarás una API key de 0x, puedes declararla como secret (ver nota abajo)
+# [vars]
+# ZEROX_API_URL = "https://api.0x.org"
